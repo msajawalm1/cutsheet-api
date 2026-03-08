@@ -1,7 +1,8 @@
 """
 Fabric Cut Sheet — Flask API
-POST /generate-pdf  →  returns JSON with base64-encoded PDF (Bubble-compatible)
-GET  /health        →  health check
+Accepts flat form-style parameters (most reliable for Bubble workflows)
+POST /generate-pdf
+GET  /health
 """
 
 import io
@@ -17,62 +18,54 @@ CORS(app)
 
 
 def fix_bubble_json(s):
-    """
-    Fixes two issues Bubble introduces into JSON strings:
-      1. Literal newlines inside string values     → escaped to \\n
-      2. Smart/curly quotes " " inside values      → escaped to \\"
-    """
+    """Fix literal newlines and smart quotes inside JSON string values."""
     result = []
     in_string   = False
     escape_next = False
-
     for ch in s:
         if escape_next:
-            result.append(ch)
-            escape_next = False
+            result.append(ch); escape_next = False
         elif ch == '\\' and in_string:
-            result.append(ch)
-            escape_next = True
-        elif ch == '"':                           # standard JSON quote
-            in_string = not in_string
-            result.append(ch)
+            result.append(ch); escape_next = True
+        elif ch == '"':
+            in_string = not in_string; result.append(ch)
         elif ch in ('\u201c', '\u201d') and in_string:
-            result.append('\\"')                  # smart quote → escaped quote
+            result.append('\\"')
         elif ch == '\n' and in_string:
-            result.append('\\n')                  # literal newline → \\n
+            result.append('\\n')
         elif ch == '\r' and in_string:
             result.append('\\r')
         else:
             result.append(ch)
-
     return ''.join(result)
 
 
+INVISIBLE_CHARS = ['\u2060', '\u200b', '\u200c', '\u200d', '\ufeff', '\u00ad']
+
+def clean_str(v):
+    if not isinstance(v, str):
+        return v
+    for ch in INVISIBLE_CHARS:
+        v = v.replace(ch, '')
+    return v.strip()
+
 def normalize(row):
-    """Fix capitalisation issues from Bubble (e.g. Hardware → hardware)."""
     if not isinstance(row, dict):
         return row
-    return {('hardware' if k.strip() == 'Hardware' else k.strip()): v
-            for k, v in row.items()}
+    cleaned = {}
+    for k, v in row.items():
+        key = 'hardware' if k.strip() == 'Hardware' else k.strip()
+        cleaned[key] = clean_str(v)
+    return cleaned
 
 
 def parse_list_field(value):
-    """
-    Handles every format Bubble can send a list in:
-      1. Proper list of dicts:           [{...}, {...}]          ← new Bubble format
-      2. List of JSON strings:           ["{...}", "{...}"]
-      3. List with ONE combined string:  ["{...},{...},{...}"]
-      4. A single JSON string of array:  "[{...},{...}]"
-    """
-    if value is None:
+    """Parse a list field regardless of how Bubble sends it."""
+    if not value:
         return []
-
-    # Already a proper list of dicts — just normalize keys
-    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
-        return [normalize(x) for x in value]
-
-    # Build a single combined string from whatever we received
     if isinstance(value, list):
+        if all(isinstance(x, dict) for x in value):
+            return [normalize(x) for x in value]
         combined = ''.join(
             item if isinstance(item, str) else json.dumps(item)
             for item in value
@@ -82,32 +75,18 @@ def parse_list_field(value):
     else:
         return []
 
-    if not combined:
+    if not combined or combined in ('[]', 'null', 'undefined'):
         return []
 
-    # Fix Bubble's encoding issues
     fixed = fix_bubble_json(combined)
-
-    # If it starts with { it's one or more objects — wrap in array
     if fixed.startswith('{'):
         fixed = '[' + fixed + ']'
 
-    parsed = json.loads(fixed)
-    return [normalize(item) for item in parsed if isinstance(item, dict)]
-
-
-def parse_dict_field(value):
-    """Parse a single dict field (e.g. 'order')."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return None
-        return json.loads(fix_bubble_json(value))
-    return value
+    try:
+        parsed = json.loads(fixed)
+        return [normalize(item) for item in parsed if isinstance(item, dict)]
+    except json.JSONDecodeError:
+        return []
 
 
 @app.route('/health', methods=['GET'])
@@ -117,25 +96,101 @@ def health():
 
 @app.route('/generate-pdf', methods=['POST'])
 def generate_pdf():
-    if not request.is_json:
-        return jsonify({"success": False, "error": "Content-Type must be application/json"}), 400
+    """
+    Accepts BOTH:
+      A) application/json  — nested JSON body (Initialize mode)
+      B) application/x-www-form-urlencoded — flat params (Bubble workflow mode)
 
-    data = request.get_json()
+    Flat param names:
+      customerName, orderName, email, orderId, phone,
+      enteredDate, weightFabric, weightHardware,
+      lineItems, accessories, notes, logoUrl
+    """
 
-    try:
-        order       = parse_dict_field(data.get('order'))
-        line_items  = parse_list_field(data.get('lineItems'))
-        accessories = parse_list_field(data.get('accessories'))
-        notes       = parse_list_field(data.get('notes'))
-        logo_url    = data.get('logoUrl') or None
-    except (ValueError, json.JSONDecodeError) as e:
-        return jsonify({"success": False, "error": f"Could not parse request data: {str(e)}"}), 400
+    # ── Detect content type and extract data ──────────────────────────────────
+    content_type = request.content_type or ''
 
-    if not order:
-        return jsonify({"success": False, "error": "Missing or empty 'order' field"}), 400
+    if 'application/json' in content_type:
+        # JSON body (Initialize / manual test)
+        try:
+            raw = request.get_json(force=True, silent=True) or {}
+        except Exception:
+            raw = {}
+
+        # Support both nested {"order":{...}, "lineItems":[...]}
+        # and flat {"customerName":"...", "lineItems":[...]}
+        if 'order' in raw and isinstance(raw['order'], (dict, str)):
+            order_raw = raw['order']
+            if isinstance(order_raw, str):
+                order_raw = json.loads(fix_bubble_json(order_raw))
+            order = order_raw
+        else:
+            order = {
+                'customerName':   raw.get('customerName',   ''),
+                'orderName':      raw.get('orderName',      ''),
+                'email':          raw.get('email',          ''),
+                'orderId':        raw.get('orderId',        ''),
+                'phone':          raw.get('phone',          ''),
+                'enteredDate':    raw.get('enteredDate',    ''),
+                'weightFabric':   raw.get('weightFabric',   ''),
+                'weightHardware': raw.get('weightHardware', ''),
+            }
+
+        line_items  = parse_list_field(raw.get('lineItems'))
+        accessories = parse_list_field(raw.get('accessories'))
+        notes       = parse_list_field(raw.get('notes'))
+        logo_url    = raw.get('logoUrl') or None
+
+    else:
+        # Form / plain body (Bubble workflow sends this)
+        # Try to parse as JSON first with force, then fall back to form
+        raw_body = request.get_data(as_text=True).strip()
+
+        if raw_body.startswith('{'):
+            # It's JSON but sent with wrong content-type
+            try:
+                raw = json.loads(fix_bubble_json(raw_body))
+            except Exception:
+                raw = {}
+
+            if 'order' in raw and isinstance(raw['order'], dict):
+                order = raw['order']
+            else:
+                order = {k: raw.get(k, '') for k in
+                         ['customerName','orderName','email','orderId',
+                          'phone','enteredDate','weightFabric','weightHardware']}
+
+            line_items  = parse_list_field(raw.get('lineItems'))
+            accessories = parse_list_field(raw.get('accessories'))
+            notes       = parse_list_field(raw.get('notes'))
+            logo_url    = raw.get('logoUrl') or None
+
+        else:
+            # True form-encoded
+            f = request.form
+            order = {
+                'customerName':   f.get('customerName',   ''),
+                'orderName':      f.get('orderName',      ''),
+                'email':          f.get('email',          ''),
+                'orderId':        f.get('orderId',        ''),
+                'phone':          f.get('phone',          ''),
+                'enteredDate':    f.get('enteredDate',    ''),
+                'weightFabric':   f.get('weightFabric',   ''),
+                'weightHardware': f.get('weightHardware', ''),
+            }
+            line_items  = parse_list_field(f.get('lineItems'))
+            accessories = parse_list_field(f.get('accessories'))
+            notes       = parse_list_field(f.get('notes'))
+            logo_url    = f.get('logoUrl') or None
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    if not any(order.values()):
+        return jsonify({"success": False, "error": "Missing order fields"}), 400
     if not line_items:
-        return jsonify({"success": False, "error": "Missing or empty 'lineItems' field"}), 400
+        return jsonify({"success": False,
+                        "error": "Missing or empty lineItems — check your Bubble workflow is passing data"}), 400
 
+    # ── Generate PDF ──────────────────────────────────────────────────────────
     try:
         pdf_buffer = io.BytesIO()
         build_pdf_from_data(
@@ -152,8 +207,7 @@ def generate_pdf():
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
-    order_name = order.get('orderName', 'Cut_Sheet') if isinstance(order, dict) else 'Cut_Sheet'
-    filename   = f"Fabric_Cut_Sheet_{order_name.replace(' ', '_')}.pdf"
+    filename = f"Fabric_Cut_Sheet_{order.get('orderName','Order').replace(' ','_')}.pdf"
 
     return jsonify({
         "success":    True,
@@ -165,3 +219,18 @@ def generate_pdf():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
+
+
+@app.route('/debug', methods=['POST'])
+def debug():
+    """
+    Temporary debug endpoint — call this from Bubble instead of /generate-pdf
+    to see exactly what Bubble is sending (content-type, body, params).
+    Remove after debugging.
+    """
+    return jsonify({
+        "content_type": request.content_type,
+        "raw_body_preview": request.get_data(as_text=True)[:500],
+        "form_keys": list(request.form.keys()),
+        "json_keys": list((request.get_json(force=True, silent=True) or {}).keys()),
+    })
